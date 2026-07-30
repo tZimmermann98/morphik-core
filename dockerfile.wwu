@@ -1,0 +1,190 @@
+# syntax=docker/dockerfile:1
+
+# Purpose: GPU image for the WWU Kubernetes deployment (harbor.uni-muenster.de/ki/morphik-gpu).
+#
+# Differences from the upstream `dockerfile`:
+#   * NVIDIA PyTorch base instead of python:3.11-slim, so torch/CUDA match the
+#     A40 vGPU driver on the cluster and flash-attn can be compiled.
+#   * flash-attn built from source (needs torch present at build time).
+#   * ColPali is loaded 4-bit quantized at runtime (COLPALI_LOAD_IN_4BIT), which
+#     needs bitsandbytes + accelerate.
+#
+# Kept identical to upstream on purpose:
+#   * libreoffice-writer/-calc/-impress — required for the docx/pptx/xlsx ->
+#     PDF -> page image path in DocumentService._create_chunks_multivector and
+#     for MorphikParser._convert_office_to_pdf_bytes. Installing only
+#     libreoffice-writer silently breaks PPTX and XLSX.
+#
+# Build:
+#   docker build -f dockerfile.wwu -t harbor.uni-muenster.de/ki/morphik-gpu:<tag> .
+
+# --- BUILD STAGE ---
+# Base image pins the Python interpreter so the venv is portable to the runtime stage.
+FROM nvcr.io/nvidia/pytorch:24.11-py3 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    gcc \
+    g++ \
+    cmake \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+WORKDIR /app
+
+# Rust toolchain: morphik-rust is a path dependency built from source.
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN python3 -m venv /app/.venv
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:${PATH}"
+ENV UV_LINK_MODE=copy
+ENV UV_CACHE_DIR=/root/.cache/uv
+
+COPY pyproject.toml uv.lock ./
+COPY fde ./fde
+COPY morphik_rust ./morphik_rust
+
+RUN --mount=type=cache,target=${UV_CACHE_DIR} \
+    uv sync --verbose --locked --no-install-project
+
+COPY . .
+COPY ee/ui-component /app/ee/ui-component
+
+RUN --mount=type=cache,target=${UV_CACHE_DIR} \
+    uv sync --verbose --locked --no-editable
+
+# flash-attn from a PREBUILT wheel rather than source.
+#
+# Building flash-attn from source takes hours and large amounts of RAM, which is
+# what makes this image impractical to build in CI. Dao-AILab publishes wheels
+# keyed on (cuda, torch, python, C++ ABI); the runtime image is Python 3.12 and
+# torch reports _GLIBCXX_USE_CXX11_ABI=True, so the cu12/torch2.8/cp312/abiTRUE
+# wheel applies. The build asserts that rather than trusting it, so a future
+# torch or base-image bump fails loudly here instead of silently degrading to
+# eager attention at runtime.
+ARG FLASH_ATTN_VERSION=2.8.3.post1
+RUN --mount=type=cache,target=${UV_CACHE_DIR} \
+    set -eux; \
+    py_tag="$(python -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"; \
+    torch_ver="$(python -c 'import torch; print(".".join(torch.__version__.split(".")[:2]))')"; \
+    abi="$(python -c 'import torch; print("TRUE" if torch._C._GLIBCXX_USE_CXX11_ABI else "FALSE")')"; \
+    test "$py_tag" = "cp312" || { echo "Unexpected Python tag $py_tag; update FLASH_ATTN wheel URL"; exit 1; }; \
+    test "$torch_ver" = "2.8"  || { echo "Unexpected torch $torch_ver; update FLASH_ATTN wheel URL"; exit 1; }; \
+    url="https://github.com/Dao-AILab/flash-attention/releases/download/v${FLASH_ATTN_VERSION}/flash_attn-${FLASH_ATTN_VERSION}+cu12torch${torch_ver}cxx11abi${abi}-${py_tag}-${py_tag}-linux_x86_64.whl"; \
+    echo "Installing $url"; \
+    uv pip install "$url"
+
+# Fail the build if flash-attn did not actually land: ColpaliEmbeddingModel
+# silently falls back to eager attention when the import is missing.
+RUN python -c "import flash_attn; print('flash_attn', flash_attn.__version__)"
+
+
+# --- PRODUCTION STAGE ---
+# Must be the IDENTICAL base image as the builder so the copied venv stays valid.
+FROM nvcr.io/nvidia/pytorch:24.11-py3
+
+WORKDIR /app
+
+# Runtime dependencies.
+# Note: docling uses rapidocr (pure Python), so tesseract-ocr is not needed.
+# LibreOffice is required for Office -> PDF -> image conversion (docx/pptx/xlsx).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libmagic1 \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libpangoft2-1.0-0 \
+    libgdk-pixbuf-2.0-0 \
+    libffi8 \
+    libxml2 \
+    libxslt1.1 \
+    libopenjp2-7 \
+    fonts-dejavu-core \
+    postgresql-client \
+    poppler-utils \
+    git \
+    libreoffice-writer \
+    libreoffice-calc \
+    libreoffice-impress \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /bin/uv /bin/uv
+COPY --from=builder /bin/uvx /bin/uvx
+COPY --from=builder /app/fde ./fde
+COPY --from=builder /app/morphik_rust ./morphik_rust
+
+RUN mkdir -p storage logs
+
+ENV PYTHONUNBUFFERED=1
+ENV VIRTUAL_ENV=/app/.venv
+ENV PATH="/app/.venv/bin:/usr/local/bin:${PATH}"
+
+# LibreOffice needs a writable HOME for its per-user profile; without it the
+# headless converter fails inside read-only/non-root containers.
+ENV HOME=/tmp
+
+COPY morphik.docker.toml /app/morphik.toml.default
+
+COPY pyproject.toml uv.lock ./
+COPY fde ./fde
+COPY core ./core
+COPY ee ./ee
+COPY utils ./utils
+COPY README.md LICENSE ./
+COPY start_server.py ./
+
+# The Helm chart invokes /app/docker-entrypoint.sh explicitly (see
+# helm-wwu/templates/deployment-{api,worker}.yaml), so this path must exist.
+# PG_HEALTHCHECK_HOST defaults to "postgres" to preserve the previous hardcoded
+# behaviour; the chart should set it to the real service name.
+RUN printf "%b" '#!/bin/bash\n\
+set -e\n\
+\n\
+if [ ! -f /app/morphik.toml ]; then\n\
+    cp /app/morphik.toml.default /app/morphik.toml\n\
+fi\n\
+\n\
+check_postgres() {\n\
+    if [ -n "$POSTGRES_URI" ]; then\n\
+        pg_host="${PG_HEALTHCHECK_HOST:-postgres}"\n\
+        pg_user="${PG_HEALTHCHECK_USER:-morphik}"\n\
+        pg_db="${PG_HEALTHCHECK_DB:-morphik}"\n\
+        echo "Waiting for PostgreSQL at $pg_host..."\n\
+        max_retries=30\n\
+        retries=0\n\
+        until PGPASSWORD=$PGPASSWORD pg_isready -h "$pg_host" -U "$pg_user" -d "$pg_db"; do\n\
+            retries=$((retries + 1))\n\
+            if [ $retries -eq $max_retries ]; then\n\
+                echo "Error: PostgreSQL did not become ready in time"\n\
+                exit 1\n\
+            fi\n\
+            echo "Waiting for PostgreSQL... (Attempt $retries/$max_retries)"\n\
+            sleep 2\n\
+        done\n\
+        echo "PostgreSQL is ready!"\n\
+    fi\n\
+}\n\
+check_postgres\n\
+\n\
+if [ $# -gt 0 ]; then\n\
+    exec "$@"\n\
+else\n\
+    # Run python directly; "uv run" would try to re-resolve the environment.\n\
+    exec python start_server.py --skip-redis-check\n\
+fi\n\
+' > /app/docker-entrypoint.sh \
+    && chmod +x /app/docker-entrypoint.sh
+
+LABEL org.opencontainers.image.title="Morphik Core (WWU GPU)"
+LABEL org.opencontainers.image.source="https://github.com/morphik-org/morphik-core"
+
+EXPOSE 8000
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
