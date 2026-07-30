@@ -77,6 +77,10 @@ class LiteLLMEmbeddingModel(BaseEmbeddingModel):
                 # Use a harmless placeholder; some LiteLLM providers demand a key even if backend ignores it
                 model_params["api_key"] = get_settings().LITELLM_DUMMY_API_KEY
 
+            # vLLM backends behind LiteLLM proxies inject encoding_format internally;
+            # explicitly set "float" so the proxy forwards a valid value instead of null.
+            model_params["encoding_format"] = "float"
+
             # Call LiteLLM with retries for transient provider errors (e.g. OpenAI 500s)
             response = await litellm.aembedding(input=texts, num_retries=3, **model_params)
 

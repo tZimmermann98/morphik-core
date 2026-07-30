@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import litellm
+
 from core.completion.litellm_completion import LiteLLMCompletionModel
 from core.config import get_settings
 from core.database.postgres_database import PostgresDatabase
@@ -34,6 +36,10 @@ from core.vector_store.multi_vector_store import MultiVectorStore
 from core.vector_store.pgvector_store import PGVectorStore
 
 logger = logging.getLogger(__name__)
+
+# The WWU vLLM gateway rejects unknown OpenAI params instead of ignoring them;
+# let LiteLLM strip anything the backend does not support.
+litellm.drop_params = True
 
 
 # ---------------------------------------------------------------------------

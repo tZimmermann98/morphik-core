@@ -1837,6 +1837,12 @@ async def startup(ctx):
     This initialization is similar to what happens in core/api.py during app startup,
     but adapted for the worker context.
     """
+    import litellm
+
+    # Mirror the API-side setting (see core/services_init.py): the WWU vLLM gateway
+    # rejects unknown OpenAI params, so let LiteLLM strip them.
+    litellm.drop_params = True
+
     _ensure_worker_logging()
     logger.info("Worker starting up. Initializing services...")
 

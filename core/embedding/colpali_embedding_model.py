@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import logging
+import os
 import time
 from contextvars import ContextVar
 from typing import Any, Dict, List, Tuple, Union
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 _INGEST_METRICS: ContextVar[Dict[str, Any]] = ContextVar("_colpali_ingest_metrics", default={})
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class ColpaliEmbeddingModel(BaseEmbeddingModel):
@@ -44,11 +49,34 @@ class ColpaliEmbeddingModel(BaseEmbeddingModel):
                     "Install flash-attn to enable FlashAttention2 on GPU."
                 )
 
+        # WWU deployment: the A40 vGPU slice has 12 GB, which is not enough for the
+        # model in bfloat16. Load it 4-bit quantized instead. Opt-in via
+        # COLPALI_LOAD_IN_4BIT so CPU/MPS and full-size GPU deployments are unaffected.
+        model_kwargs = {
+            "dtype": torch.bfloat16,  # preferred kwarg per upstream deprecation notice
+            "device_map": device,  # Automatically detect and use available device
+            "attn_implementation": attn_implementation,
+        }
+        if _env_flag("COLPALI_LOAD_IN_4BIT"):
+            if device != "cuda":
+                logger.warning("COLPALI_LOAD_IN_4BIT requires CUDA; ignoring it on device '%s'.", device)
+            else:
+                from transformers import BitsAndBytesConfig
+
+                logger.info("Loading ColPali with 4-bit NF4 quantization")
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+                # bitsandbytes places the weights itself; device_map/dtype would conflict.
+                model_kwargs.pop("device_map")
+                model_kwargs.pop("dtype")
+
         self.model = ColQwen2_5.from_pretrained(
             "tsystems/colqwen2.5-3b-multilingual-v1.0",
-            dtype=torch.bfloat16,  # preferred kwarg per upstream deprecation notice
-            device_map=device,  # Automatically detect and use available device
-            attn_implementation=attn_implementation,
+            **model_kwargs,
         ).eval()
         self.processor: ColQwen2_5_Processor = ColQwen2_5_Processor.from_pretrained(
             "tsystems/colqwen2.5-3b-multilingual-v1.0",

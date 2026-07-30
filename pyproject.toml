@@ -74,6 +74,10 @@ dependencies = [
     "fastkmeans",
     "morphik-rust",
     "opencv-python-headless>=4.12.0.88",
+    # WWU deployment: 4-bit ColPali loading on the 12 GB A40 vGPU slice
+    # (see COLPALI_LOAD_IN_4BIT in core/embedding/colpali_embedding_model.py).
+    "accelerate>=0.30.0",
+    "bitsandbytes>=0.43.0",
 ]
 
 [dependency-groups]
