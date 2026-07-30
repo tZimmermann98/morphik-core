@@ -244,3 +244,88 @@ async def test_frame_descriptions_do_not_mention_transcripts_when_transcript_is_
     assert result.time_to_content == {0.0: "visible frame"}
     assert len(parser.vision_client.contexts) == 1
     assert "transcript" not in parser.vision_client.contexts[0].lower()
+
+
+# --- WWU deployment: videos must never fail a whole ingestion batch ---------
+
+
+def _skip_parser(video_modules, *, assemblyai_api_key=None, frame_sample_rate=None):
+    parser = object.__new__(video_modules.MorphikParser)
+    parser._assemblyai_api_key = assemblyai_api_key
+    parser.frame_sample_rate = frame_sample_rate
+    parser.logger = logging.getLogger("test.morphik_parser")
+    return parser
+
+
+@pytest.mark.asyncio
+async def test_video_is_skipped_when_neither_transcript_nor_frames_are_configured(monkeypatch, video_modules):
+    """frame_sample_rate = -1 and no AssemblyAI key means there is nothing to extract."""
+    monkeypatch.setattr(
+        video_modules.morphik_parser_module,
+        "load_config",
+        lambda: {"parser": {"vision": {"frame_sample_rate": -1}}},
+    )
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("_parse_video must not be called when video parsing is unconfigured")
+
+    monkeypatch.setattr(video_modules.morphik_parser_module, "VideoParser", _explode)
+
+    parser = _skip_parser(video_modules, frame_sample_rate=-1)
+    metadata, text = await parser._parse_video_or_skip(b"video bytes", "clip.mp4")
+
+    assert text == ""
+    assert metadata["video_skipped"] == "video parsing not configured"
+
+
+@pytest.mark.asyncio
+async def test_video_parsing_failure_is_not_fatal(monkeypatch, video_modules):
+    """A broken/unsupported video must degrade to 'no content', not raise."""
+    monkeypatch.setattr(
+        video_modules.morphik_parser_module,
+        "load_config",
+        lambda: {"parser": {"vision": {"frame_sample_rate": 5}}},
+    )
+
+    class _BrokenVideoParser:
+        def __init__(self, *args, **kwargs):
+            raise ValueError("Could not open video file")
+
+    monkeypatch.setattr(video_modules.morphik_parser_module, "VideoParser", _BrokenVideoParser)
+
+    parser = _skip_parser(video_modules, frame_sample_rate=5)
+    metadata, text = await parser._parse_video_or_skip(b"not really a video", "clip.mp4")
+
+    assert text == ""
+    assert "Could not open video file" in metadata["video_skipped"]
+
+
+@pytest.mark.asyncio
+async def test_video_is_still_parsed_when_configured(monkeypatch, video_modules):
+    """The skip wrapper must not disable video ingestion where it is set up."""
+    fake_video_parser = _fake_video_parser_class(video_modules.ParseVideoResult, video_modules.TimeSeriesData)
+    monkeypatch.setattr(video_modules.morphik_parser_module, "VideoParser", fake_video_parser)
+    monkeypatch.setattr(
+        video_modules.morphik_parser_module,
+        "load_config",
+        lambda: {"parser": {"vision": {"frame_sample_rate": 5}}},
+    )
+
+    parser = _skip_parser(video_modules, assemblyai_api_key="assembly-key", frame_sample_rate=1)
+    metadata, text = await parser._parse_video_or_skip(b"video bytes", "clip.mp4")
+
+    assert "video_skipped" not in metadata
+    assert "Transcript:\nspoken words" in text
+
+
+@pytest.mark.asyncio
+async def test_deep_parse_fallback_skips_videos(monkeypatch, video_modules):
+    """Docling cannot read video containers; the deep fallback must not try."""
+    parser = _skip_parser(video_modules, frame_sample_rate=5)
+    monkeypatch.setattr(type(parser), "_is_plain_text_file", lambda self, filename: False, raising=False)
+    monkeypatch.setattr(type(parser), "_is_video_file", lambda self, file, filename: True, raising=False)
+
+    metadata, text = await parser.parse_file_to_text_deep(b"video bytes", "clip.mp4")
+
+    assert text == ""
+    assert metadata["video_skipped"] == "video parsing not configured"

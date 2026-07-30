@@ -427,6 +427,45 @@ class MorphikParser(BaseParser):
         wb.close()
         return "\n".join(parts)
 
+    def _video_parsing_configured(self) -> bool:
+        """True when video ingestion can actually produce text.
+
+        Needs either an AssemblyAI key (transcript) or a positive frame sample
+        rate (vision frame descriptions). With neither, parsing a video is pure
+        cost for an empty result.
+        """
+        if self._assemblyai_api_key:
+            return True
+        try:
+            config = load_config()
+            frame_sample_rate = config.get("parser", {}).get("vision", {}).get("frame_sample_rate")
+        except Exception:
+            frame_sample_rate = None
+        if frame_sample_rate is None:
+            frame_sample_rate = self.frame_sample_rate
+        return bool(frame_sample_rate and frame_sample_rate > 0)
+
+    async def _parse_video_or_skip(self, file: bytes, filename: str) -> Tuple[Dict[str, Any], str]:
+        """Parse a video, but never fail ingestion because of it.
+
+        Videos are best-effort: when transcription/vision is not configured, or
+        the video pipeline errors out, we return no text and let the ingestion
+        worker record the document as content-less rather than failing the whole
+        batch.
+        """
+        if not self._video_parsing_configured():
+            self.logger.warning(
+                "Skipping video %s: no AssemblyAI key and no positive parser.vision.frame_sample_rate configured.",
+                filename,
+            )
+            return {"video_skipped": "video parsing not configured"}, ""
+
+        try:
+            return await self._parse_video(file)
+        except Exception as e:
+            self.logger.warning("Video parsing failed for %s, skipping content extraction: %s", filename, e)
+            return {"video_skipped": f"video parsing failed: {e}"}, ""
+
     async def _parse_video(self, file: bytes) -> Tuple[Dict[str, Any], str]:
         """Parse video file to extract frame descriptions and, when configured, transcript."""
         # Save video to temporary file
@@ -617,7 +656,7 @@ class MorphikParser(BaseParser):
     async def parse_file_to_text(self, file: bytes, filename: str) -> Tuple[Dict[str, Any], str]:
         """Parse file content into text based on file type"""
         if self._is_video_file(file, filename):
-            return await self._parse_video(file)
+            return await self._parse_video_or_skip(file, filename)
         elif self._is_xml_file(filename):
             # For XML files, we'll handle parsing and chunking together
             # This method should not be called for XML files in normal flow
@@ -629,6 +668,11 @@ class MorphikParser(BaseParser):
         """Run an expensive parse fallback after normal parsing produced no usable chunks."""
         if self._is_plain_text_file(filename):
             return await self.parse_file_to_text(file, filename)
+
+        # Docling cannot read video containers; re-running it here would raise and
+        # fail the job for a file we already decided to skip.
+        if self._is_video_file(file, filename):
+            return {"video_skipped": "video parsing not configured"}, ""
 
         parse_file = file
         parse_filename = filename
