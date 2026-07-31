@@ -42,6 +42,12 @@ ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:${PATH}"
 ENV UV_LINK_MODE=copy
 ENV UV_CACHE_DIR=/root/.cache/uv
+# Force uv to use the base image's interpreter. Without this, uv silently
+# downloads its own managed CPython when .python-version does not match what is
+# installed, and builds the venv against an interpreter that lives in
+# /root/.local/share/uv/python — which the runtime stage does not copy, so the
+# image would ship a venv pointing at a missing interpreter.
+ENV UV_PYTHON_DOWNLOADS=never
 
 COPY pyproject.toml uv.lock ./
 COPY fde ./fde
