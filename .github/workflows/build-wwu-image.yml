@@ -80,6 +80,7 @@ jobs:
           password: ${{ secrets.HARBOR_PASSWORD }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -93,6 +94,18 @@ jobs:
           cache-from: type=registry,ref=harbor.uni-muenster.de/ki/morphik-gpu:buildcache
           cache-to: type=registry,ref=harbor.uni-muenster.de/ki/morphik-gpu:buildcache,mode=max
           provenance: false
+
+      - name: Report pushed image
+        if: success()
+        run: |
+          TAG='${{ steps.meta.outputs.tag }}'
+          echo "image: harbor.uni-muenster.de/ki/morphik-gpu:$TAG"
+          echo "digest: ${{ steps.build.outputs.digest }}"
+          # The ki project is public for reads, so confirm the tag is actually
+          # retrievable rather than trusting the push step's exit code.
+          curl -sS --max-time 60 \
+            "https://harbor.uni-muenster.de/api/v2.0/projects/ki/repositories/morphik-gpu/artifacts/$TAG?with_tag=true" \
+            | head -c 400 || echo "(harbor readback failed - check manually)"
 
       - name: Report disk usage
         if: always()
