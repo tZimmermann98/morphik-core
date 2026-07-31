@@ -430,17 +430,23 @@ class MorphikParser(BaseParser):
     def _video_parsing_configured(self) -> bool:
         """True when video ingestion can actually produce text.
 
-        Needs either an AssemblyAI key (transcript) or a positive frame sample
-        rate (vision frame descriptions). With neither, parsing a video is pure
-        cost for an empty result.
+        Needs at least one of: a transcription backend (AssemblyAI key, or a
+        self-hosted provider such as Voxtral) or a positive frame sample rate
+        for vision frame descriptions. With none of them, parsing a video is
+        pure cost for an empty result.
         """
         if self._assemblyai_api_key:
             return True
         try:
-            config = load_config()
-            frame_sample_rate = config.get("parser", {}).get("vision", {}).get("frame_sample_rate")
+            parser_config = load_config().get("parser", {})
         except Exception:
-            frame_sample_rate = None
+            parser_config = {}
+
+        provider = str((parser_config.get("transcription", {}) or {}).get("provider", "")).lower()
+        if provider and provider not in {"assemblyai", "none"}:
+            return True
+
+        frame_sample_rate = (parser_config.get("vision", {}) or {}).get("frame_sample_rate")
         if frame_sample_rate is None:
             frame_sample_rate = self.frame_sample_rate
         return bool(frame_sample_rate and frame_sample_rate > 0)
@@ -488,22 +494,23 @@ class MorphikParser(BaseParser):
             )
             results = await parser.process_video()
 
-            # Combine frame descriptions and optional transcript
+            # Combine frame descriptions and optional transcript.
+            # Keyed off whether a transcript was actually produced rather than off
+            # the AssemblyAI key, so a self-hosted backend (Voxtral) is included too.
             frame_text = "\n".join(results.frame_descriptions.time_to_content.values())
+            transcript_text = "\n".join(results.transcript.time_to_content.values())
             text_sections = []
             if frame_text:
                 text_sections.append(f"Frame Descriptions:\n{frame_text}")
-            if self._assemblyai_api_key:
-                transcript_text = "\n".join(results.transcript.time_to_content.values())
-                if transcript_text:
-                    text_sections.append(f"Transcript:\n{transcript_text}")
+            if transcript_text.strip():
+                text_sections.append(f"Transcript:\n{transcript_text}")
             combined_text = "\n\n".join(text_sections)
 
             metadata = {
                 "video_metadata": results.metadata,
                 "frame_timestamps": list(results.frame_descriptions.time_to_content.keys()),
             }
-            if self._assemblyai_api_key:
+            if transcript_text.strip():
                 metadata["transcript_timestamps"] = list(results.transcript.time_to_content.keys())
 
             return metadata, combined_text

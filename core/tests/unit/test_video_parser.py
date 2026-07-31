@@ -4,7 +4,6 @@ import types
 
 import pytest
 
-
 MODULES_UNDER_TEST = [
     "core.models.video",
     "core.parser.video.parse_video",
@@ -112,7 +111,7 @@ def video_modules(monkeypatch):
         _drop_module(module_name)
 
 
-def _fake_video_parser_class(ParseVideoResult, TimeSeriesData):
+def _fake_video_parser_class(ParseVideoResult, TimeSeriesData, transcript=None):
     class _FakeVideoParser:
         instances = []
 
@@ -131,15 +130,23 @@ def _fake_video_parser_class(ParseVideoResult, TimeSeriesData):
                     "frame_sample_rate": self.frame_sample_rate,
                 },
                 frame_descriptions=TimeSeriesData(time_to_content={0.0: "visible frame"}),
-                transcript=TimeSeriesData(time_to_content={0.5: "spoken words"}),
+                transcript=TimeSeriesData(time_to_content={0.5: "spoken words"} if transcript is None else transcript),
             )
 
     return _FakeVideoParser
 
 
 @pytest.mark.asyncio
-async def test_parse_video_skips_transcript_without_assemblyai_key(monkeypatch, video_modules):
-    fake_video_parser = _fake_video_parser_class(video_modules.ParseVideoResult, video_modules.TimeSeriesData)
+async def test_parse_video_omits_transcript_section_when_there_is_no_transcript(monkeypatch, video_modules):
+    """No transcription backend -> VideoParser yields an empty transcript -> no section.
+
+    The filtering lives in VideoParser (which returns empty when no backend is
+    configured) rather than in the caller, so that a self-hosted backend with no
+    AssemblyAI key still gets its transcript through.
+    """
+    fake_video_parser = _fake_video_parser_class(
+        video_modules.ParseVideoResult, video_modules.TimeSeriesData, transcript={}
+    )
     monkeypatch.setattr(video_modules.morphik_parser_module, "VideoParser", fake_video_parser)
     monkeypatch.setattr(
         video_modules.morphik_parser_module,
@@ -329,3 +336,140 @@ async def test_deep_parse_fallback_skips_videos(monkeypatch, video_modules):
 
     assert text == ""
     assert metadata["video_skipped"] == "video parsing not configured"
+
+
+# --- Voxtral transcription backend -----------------------------------------
+
+
+def test_voxtral_transcriber_strips_litellm_prefix_and_windows_audio(monkeypatch, video_modules):
+    """model_name is a LiteLLM id; the HTTP endpoint wants the bare name."""
+    mod = video_modules.parse_video_module
+    t = mod.VoxtralTranscriber(
+        {
+            "model_name": "hosted_vllm/Voxtral-Mini-3B-2507",
+            "api_base": "https://gpt.example/v1/",
+            "api_key": "k",
+        },
+        chunk_seconds=60,
+    )
+    assert t.model_name == "Voxtral-Mini-3B-2507"
+    assert t.api_base == "https://gpt.example/v1"
+
+    windows = []
+    monkeypatch.setattr(t, "_extract_audio_chunk", lambda v, s, o: windows.append(s) or True)
+    monkeypatch.setattr(t, "_transcribe_file", lambda p: "text at %d" % windows[-1])
+
+    result = t.transcribe("/tmp/v.mp4", duration=150.0)
+
+    assert windows == [0.0, 60.0, 120.0]
+    assert result == {0.0: "text at 0", 60.0: "text at 60", 120.0: "text at 120"}
+
+
+def test_voxtral_one_bad_window_does_not_lose_the_transcript(monkeypatch, video_modules):
+    mod = video_modules.parse_video_module
+    t = mod.VoxtralTranscriber(
+        {"model_name": "Voxtral", "api_base": "https://gpt.example/v1", "api_key": "k"},
+        chunk_seconds=60,
+    )
+    monkeypatch.setattr(t, "_extract_audio_chunk", lambda v, s, o: True)
+
+    def _flaky(path):
+        if "chunk_60" in path:
+            raise RuntimeError("gateway hiccup")
+        return "ok"
+
+    monkeypatch.setattr(t, "_transcribe_file", _flaky)
+    result = t.transcribe("/tmp/v.mp4", duration=180.0)
+
+    assert set(result) == {0.0, 120.0}
+
+
+def test_voxtral_silent_video_yields_empty_transcript(monkeypatch, video_modules):
+    """A video with no audio track is not an error."""
+    mod = video_modules.parse_video_module
+    t = mod.VoxtralTranscriber({"model_name": "Voxtral", "api_base": "https://gpt.example/v1"}, chunk_seconds=60)
+    monkeypatch.setattr(t, "_extract_audio_chunk", lambda v, s, o: False)
+    assert t.transcribe("/tmp/v.mp4", duration=120.0) == {}
+
+
+def test_voxtral_requires_api_base_and_model(video_modules):
+    mod = video_modules.parse_video_module
+    with pytest.raises(ValueError):
+        mod.VoxtralTranscriber({"model_name": "", "api_base": ""})
+
+
+@pytest.mark.asyncio
+async def test_transcript_is_included_without_an_assemblyai_key(monkeypatch, video_modules):
+    """The self-hosted backend produces a transcript with no AssemblyAI key set.
+
+    Regression: _parse_video used to gate the transcript on _assemblyai_api_key,
+    which silently discarded Voxtral output.
+    """
+    fake_video_parser = _fake_video_parser_class(video_modules.ParseVideoResult, video_modules.TimeSeriesData)
+    monkeypatch.setattr(video_modules.morphik_parser_module, "VideoParser", fake_video_parser)
+    monkeypatch.setattr(
+        video_modules.morphik_parser_module,
+        "load_config",
+        lambda: {"parser": {"vision": {"frame_sample_rate": 5}}},
+    )
+
+    parser = object.__new__(video_modules.MorphikParser)
+    parser._assemblyai_api_key = None
+    parser.frame_sample_rate = 1
+    parser.logger = logging.getLogger("test.morphik_parser")
+
+    metadata, text = await parser._parse_video(b"video bytes")
+
+    assert "Transcript:\nspoken words" in text
+    assert metadata["transcript_timestamps"] == [0.5]
+
+
+def test_video_parsing_is_configured_when_a_transcription_provider_is_set(monkeypatch, video_modules):
+    """frame_sample_rate = -1 plus a Voxtral backend still counts as configured."""
+    monkeypatch.setattr(
+        video_modules.morphik_parser_module,
+        "load_config",
+        lambda: {
+            "parser": {
+                "vision": {"frame_sample_rate": -1},
+                "transcription": {"provider": "voxtral", "model": "voxtral_transcribe"},
+            }
+        },
+    )
+    parser = _skip_parser(video_modules, frame_sample_rate=-1)
+    assert parser._video_parsing_configured() is True
+
+
+@pytest.mark.asyncio
+async def test_process_video_transcribes_with_a_non_assemblyai_backend(video_modules):
+    """process_video must not gate the transcript on the AssemblyAI transcriber.
+
+    Regression: it called get_transcript() only when self.transcriber was set, so
+    a self-hosted backend silently produced no transcript even though it was
+    configured correctly. Unit tests that fake VideoParser cannot catch this
+    because they bypass process_video entirely.
+    """
+    parser = object.__new__(video_modules.VideoParser)
+    parser.duration, parser.fps, parser.total_frames = 10.0, 1.0, 10
+    parser.frame_sample_rate = 5
+    parser.transcriber = None  # no AssemblyAI
+    parser.voxtral = object()  # self-hosted backend configured
+    parser.transcript = video_modules.TimeSeriesData(time_to_content={})
+
+    calls = []
+
+    def _get_transcript():
+        calls.append(True)
+        parser.transcript = video_modules.TimeSeriesData(time_to_content={0.0: "hello from voxtral"})
+        return parser.transcript
+
+    async def _get_frame_descriptions():
+        return video_modules.TimeSeriesData(time_to_content={})
+
+    parser.get_transcript = _get_transcript
+    parser.get_frame_descriptions = _get_frame_descriptions
+
+    result = await parser.process_video()
+
+    assert calls, "get_transcript() was never called"
+    assert result.transcript.time_to_content == {0.0: "hello from voxtral"}
