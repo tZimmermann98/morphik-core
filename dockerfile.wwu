@@ -132,9 +132,15 @@ ENV PYTHONUNBUFFERED=1
 ENV VIRTUAL_ENV=/app/.venv
 ENV PATH="/app/.venv/bin:/usr/local/bin:${PATH}"
 
-# LibreOffice needs a writable HOME for its per-user profile; without it the
-# headless converter fails inside read-only/non-root containers.
-ENV HOME=/tmp
+# Deliberately NOT setting HOME here.
+#
+# An earlier revision set HOME=/tmp so LibreOffice had a writable profile dir.
+# That is unnecessary — the container runs as root and /root is writable — and
+# it is actively harmful in this deployment: the huggingface-cache PVC mounts at
+# /root/.cache/huggingface, so moving HOME sends the ~5 GB ColQwen download to
+# the container's writable layer instead. That exceeds the pod's
+# ephemeral-storage limit and the kubelet evicts it, repeatedly.
+# The Helm chart pins HOME=/root explicitly; leave it alone here.
 
 COPY morphik.docker.toml /app/morphik.toml.default
 
