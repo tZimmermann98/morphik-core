@@ -65,9 +65,13 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # Push events carry no inputs, so fall back to the release tag.
+      # Bump this when the image content changes rather than overwriting a tag
+      # that running pods reference: with imagePullPolicy IfNotPresent an
+      # overwritten tag silently stops matching the digest actually running, and
+      # the previous tag stays valid as a rollback target.
       - name: Resolve image tag
         id: meta
-        run: echo "tag=${{ inputs.tag || 'upstream-2026-07' }}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=${{ inputs.tag || 'upstream-2026-07-video' }}" >> "$GITHUB_OUTPUT"
 
       # Only Harbor needs credentials: nvcr.io hands out anonymous pull tokens
       # for nvidia/pytorch, so no NGC account or secret is required.
