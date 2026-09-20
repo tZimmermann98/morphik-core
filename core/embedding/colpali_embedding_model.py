@@ -16,8 +16,12 @@ from core.config import get_settings
 from core.embedding.base_embedding_model import BaseEmbeddingModel
 from core.models.chunk import Chunk
 from core.utils.fast_ops import data_uri_to_bytes
+from core.utils.transformers_compat import patch_hub_chat_template_listing
 
 logger = logging.getLogger(__name__)
+
+# Must run before any from_pretrained call in this module.
+patch_hub_chat_template_listing()
 
 
 _INGEST_METRICS: ContextVar[Dict[str, Any]] = ContextVar("_colpali_ingest_metrics", default={})

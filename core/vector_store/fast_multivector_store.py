@@ -23,6 +23,7 @@ from core.storage.local_storage import LocalStorage
 from core.storage.s3_storage import S3Storage
 from core.storage.utils_file_extensions import detect_file_type
 from core.utils.fast_ops import bytes_to_data_uri, encode_base64
+from core.utils.transformers_compat import patch_hub_chat_template_listing
 
 from .base_vector_store import BaseVectorStore
 from .utils import (
@@ -36,6 +37,9 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Must run before any from_pretrained call in this module.
+patch_hub_chat_template_listing()
 
 
 def _decoded_base64_size(content: str) -> int:
